@@ -8,7 +8,7 @@ dependencies:
   repository: https://kubernetes-charts.storage.googleapis.com/
   condition: docker-registry.enabled
 - name: minio
-  version: 2.5.x
+  version: 5.0.33
   repository: https://kubernetes-charts.storage.googleapis.com/
   condition: minio.enabled
 - name: mysql
