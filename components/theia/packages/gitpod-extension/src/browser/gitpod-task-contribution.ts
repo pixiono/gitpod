@@ -4,23 +4,23 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
-import { FrontendApplicationContribution } from '@theia/core/lib/browser';
+import { FrontendApplicationContribution, WidgetManager, Widget } from '@theia/core/lib/browser';
 import { Deferred } from '@theia/core/lib/common/promise-util';
 import { TerminalWidget } from '@theia/terminal/lib/browser/base/terminal-widget';
 import { TerminalFrontendContribution } from '@theia/terminal/lib/browser/terminal-frontend-contribution';
 import { IBaseTerminalServer } from '@theia/terminal/lib/common/base-terminal-protocol';
 import { inject, injectable, postConstruct } from 'inversify';
-import { GitpodTask, GitpodTaskServer, GitpodTaskState } from '../common/gitpod-task-protocol';
+import { GitpodTask, GitpodTaskServer, GitpodTaskState, AttachTaskTerminalParams } from '../common/gitpod-task-protocol';
 import { GitpodTerminalWidget } from './gitpod-terminal-widget';
 
 interface GitpodTaskTerminalWidget extends GitpodTerminalWidget {
     readonly kind: 'gitpod-task'
-    applyTask(updated: GitpodTask): Promise<void>
+    applyTask(updated: GitpodTask): void
 }
 namespace GitpodTaskTerminalWidget {
     const idPrefix = 'gitpod-task-terminal'
-    export function is(terminal: TerminalWidget): terminal is GitpodTaskTerminalWidget {
-        return terminal.kind === 'gitpod-task';
+    export function is(terminal: Widget): terminal is GitpodTaskTerminalWidget {
+        return terminal instanceof GitpodTerminalWidget && terminal.kind === 'gitpod-task';
     }
     export function toTerminalId(id: string): string {
         return idPrefix + ':' + id;
@@ -32,6 +32,9 @@ namespace GitpodTaskTerminalWidget {
 
 @injectable()
 export class GitpodTaskContribution implements FrontendApplicationContribution {
+
+    @inject(WidgetManager)
+    private readonly widgetManager: WidgetManager;
 
     @inject(TerminalFrontendContribution)
     private readonly terminals: TerminalFrontendContribution;
@@ -54,7 +57,8 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
                 this.queue(() => this.updateTerminals(updated));
             }
         });
-        this.terminals.onDidCreateTerminal(terminal => {
+        this.widgetManager.onWillCreateWidget(event => {
+            const terminal = event.widget;
             if (GitpodTaskTerminalWidget.is(terminal)) {
                 this.taskTerminals.set(terminal.id, terminal);
                 terminal.onDidDispose(() =>
@@ -67,33 +71,54 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
                     }
                     return terminal['createTerminal']()
                 })
+
                 let starting = false;
                 const start = terminal['start'].bind(terminal);
-                terminal['start'] = async id => {
-                    starting = true;
-                    try {
-                        return start(id)
-                    } finally {
-                        starting = false;
+                terminal['start'] = id => {
+                    // don't convert to async
+                    if (starting) {
+                        throw new Error('gitpod task terminal is already starting, id:' + terminal.id)
                     }
+                    starting = true;
+                    return start(id);
+                }
+                terminal.onDidOpen(() => starting = false);
+                terminal.onDidOpenFailure(() => starting = false);
+
+                let attachingToTask = false;
+                const attachToTask = (params: AttachTaskTerminalParams) => {
+                    // don't convert to async
+                    if (attachingToTask) {
+                        throw new Error('gitpod task terminal is already attaching, id:' + terminal.id)
+                    }
+                    attachingToTask = true;
+                    return this.server.attach(params)
+                        .then(() => attachingToTask = false)
+                        .catch(e => {
+                            attachingToTask = false;
+                            throw e
+                        });
                 }
 
                 let task: GitpodTask | undefined;
-                const update = async () => {
+                const update = () => {
                     if (task?.state === GitpodTaskState.CLOSED) {
                         terminal.dispose();
                         return;
                     }
+
                     const remoteTerminal = task?.terminal;
-                    if (task?.state !== GitpodTaskState.RUNNING || !remoteTerminal || starting) {
+                    if (task?.state !== GitpodTaskState.RUNNING || !remoteTerminal || starting || attachingToTask) {
                         return;
                     }
+
                     const terminalId = terminal.terminalId;
-                    if (IBaseTerminalServer.validateId(terminalId)) {
-                        await this.server.attach({ terminalId, remoteTerminal });
-                    } else {
-                        await terminal.start();
+                    if (!IBaseTerminalServer.validateId(terminalId)) {
+                        terminal.start();
+                        return;
                     }
+
+                    attachToTask({ terminalId, remoteTerminal })
                 }
                 terminal.applyTask = updated => {
                     task = updated
@@ -150,7 +175,7 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
         }
     }
 
-    private async updateTerminals(tasks: GitpodTask[]): Promise<void> {
+    private updateTerminals(tasks: GitpodTask[]): void {
         for (const task of tasks) {
             try {
                 const id = GitpodTaskTerminalWidget.toTerminalId(task.id);
@@ -158,14 +183,14 @@ export class GitpodTaskContribution implements FrontendApplicationContribution {
                 if (!terminal) {
                     continue;
                 }
-                await terminal.applyTask(task);
+                terminal.applyTask(task);
             } catch (e) {
                 console.error('Failed to update Gitpod task terminal:', e);
             }
         }
     }
 
-    private queue(update: () => Promise<void>): Promise<void> {
+    private queue(update: () => void): Promise<void> {
         return this.updateQueue = this.updateQueue.then(update, update);
     }
 

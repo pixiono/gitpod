@@ -9,6 +9,7 @@ import { JsonRpcProxy } from '@theia/core/lib/common/messaging/proxy-factory';
 import { ApplicationShell } from '@theia/core/lib/browser';
 import { Deferred } from '@theia/core/lib/common/promise-util';
 import { ProcessManager, TerminalProcess } from '@theia/process/lib/node';
+import { timeout } from '@theia/core/lib/common/promise-util';
 import * as fs from 'fs';
 import { inject, injectable, postConstruct } from 'inversify';
 import * as path from 'path';
@@ -93,20 +94,44 @@ export class GitpodTaskServerImpl implements GitpodTaskServer {
         }
     }
 
+    private readonly attaching = new Map<number, Promise<void>>();
     async attach({ terminalId, remoteTerminal }: AttachTaskTerminalParams): Promise<void> {
         const terminalProcess = this.processManager.get(terminalId);
         if (!(terminalProcess instanceof TerminalProcess)) {
             return;
         }
-        const [supervisorBin, children] = await Promise.all([
-            this.supervisorBin,
-            util.promisify(psTree)(terminalProcess.pid)
-        ]);
-        const supervisorCommand = path.basename(supervisorBin);
-        if (children.some(child => child.COMMAND === supervisorCommand)) {
-            return;
-        }
-        terminalProcess.write(`${supervisorBin} terminal attach -ir ${remoteTerminal}\r\n`);
+        const pid = terminalProcess.pid;
+        let queue = this.attaching.get(pid) || Promise.resolve();
+        queue = queue.then(async () => {
+            try {
+                let [supervisorBin, children] = await Promise.all([
+                    this.supervisorBin,
+                    util.promisify(psTree)(terminalProcess.pid)
+                ]);
+                if (children.length) {
+                    return;
+                }
+                const supervisorCommand = path.basename(supervisorBin);
+                if (children.some(child => child.COMMAND === supervisorCommand)) {
+                    return;
+                }
+                terminalProcess.write(`${supervisorBin} terminal attach -ir ${remoteTerminal}\r\n`);
+                const delay = 2000;
+                const interval = 150;
+                const attempts = delay / interval;
+                for (let i = 0; i < attempts; i++) {
+                    children = await util.promisify(psTree)(terminalProcess.pid);
+                    if (children.some(child => child.COMMAND === supervisorCommand)) {
+                        return
+                    }
+                    await timeout(interval);
+                }
+            } catch (e) {
+                console.error(`failed to attach the process (${pid}) to the task terminal (${remoteTerminal})`, e);
+            }
+        });
+        this.attaching.set(pid, queue);
+        return queue;
     }
 
     setClient(client: JsonRpcProxy<GitpodTaskClient>): void {
